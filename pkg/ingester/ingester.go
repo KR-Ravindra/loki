@@ -578,14 +578,8 @@ func (i *Ingester) starting(ctx context.Context) (err error) {
 		defer checkpointCloser.Close()
 
 		checkpointRecoveryErr := RecoverCheckpoint(checkpointReader, recoverer)
-		if checkpointRecoveryErr != nil {
-			i.metrics.walCorruptionsTotal.WithLabelValues(walTypeCheckpoint).Inc()
-			level.Error(i.logger).Log(
-				"msg",
-				`Recovered from checkpoint with errors. Some streams were likely not recovered due to WAL checkpoint file corruptions (or WAL file deletions while Loki is running). No administrator action is needed and data loss is only a possibility if more than (replication factor / 2 + 1) ingesters suffer from this.`,
-				"elapsed", time.Since(start).String(),
-			)
-		}
+		reportWALRecoveryErr(i, checkpointRecoveryErr, walTypeCheckpoint,
+			`Recovered from checkpoint with errors. Some streams were likely not recovered due to WAL checkpoint file corruptions (or WAL file deletions while Loki is running). No administrator action is needed and data loss is only a possibility if more than (replication factor / 2 + 1) ingesters suffer from this.`)
 		level.Info(i.logger).Log(
 			"msg", "recovered WAL checkpoint recovery finished",
 			"elapsed", time.Since(start).String(),
@@ -600,14 +594,8 @@ func (i *Ingester) starting(ctx context.Context) (err error) {
 		defer segmentCloser.Close()
 
 		segmentRecoveryErr := RecoverWAL(ctx, segmentReader, recoverer)
-		if segmentRecoveryErr != nil {
-			i.metrics.walCorruptionsTotal.WithLabelValues(walTypeSegment).Inc()
-			level.Error(i.logger).Log(
-				"msg",
-				"Recovered from WAL segments with errors. Some streams and/or entries were likely not recovered due to WAL segment file corruptions (or WAL file deletions while Loki is running). No administrator action is needed and data loss is only a possibility if more than (replication factor / 2 + 1) ingesters suffer from this.",
-				"elapsed", time.Since(start).String(),
-			)
-		}
+		reportWALRecoveryErr(i, segmentRecoveryErr, walTypeSegment,
+			"Recovered from WAL segments with errors. Some streams and/or entries were likely not recovered due to WAL segment file corruptions (or WAL file deletions while Loki is running). No administrator action is needed and data loss is only a possibility if more than (replication factor / 2 + 1) ingesters suffer from this.")
 		level.Info(i.logger).Log(
 			"msg", "WAL segment recovery finished",
 			"elapsed", time.Since(start).String(),
@@ -1660,6 +1648,31 @@ func adjustQueryStartTime(maxLookBackPeriod time.Duration, start, now time.Time)
 		}
 	}
 	return start
+}
+
+// reportWALRecoveryErr reports a WAL recovery error to metrics and logs. Backpressure and corruption are
+// different problems with different remedies, so they are reported to different metrics and have different
+// log messages. This function handles both cases; callers must classify the error before calling this.
+func reportWALRecoveryErr(i *Ingester, err error, walType string, corruptionMessage string) {
+	if err == nil {
+		return
+	}
+
+	if IsBackpressureError(err) {
+		i.metrics.walReplayBackpressureFailuresTotal.WithLabelValues(walType).Inc()
+		level.Error(i.logger).Log(
+			"msg",
+			"Recovered from WAL replay with backpressure. Some streams and/or entries may not have been recovered because the ingester could not drain below the replay memory ceiling. Administrator action is needed: raise `-ingester.wal-replay-memory-ceiling`, or fix whatever is preventing flushes from draining (object storage slow/unavailable, chunk_retain_period holding chunks, failing immediate flush ops).",
+			"elapsed", "unknown", // elapsed time not available in helper function
+		)
+	} else {
+		i.metrics.walCorruptionsTotal.WithLabelValues(walType).Inc()
+		level.Error(i.logger).Log(
+			"msg",
+			corruptionMessage,
+			"elapsed", "unknown", // elapsed time not available in helper function
+		)
+	}
 }
 
 func (i *Ingester) GetDetectedFields(_ context.Context, r *logproto.DetectedFieldsRequest) (*logproto.DetectedFieldsResponse, error) {

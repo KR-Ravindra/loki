@@ -1,6 +1,7 @@
 package ingester
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -314,4 +315,24 @@ func TestReplayControllerConcurrentFlushes(t *testing.T) {
 		require.Equal(t, int32(1), flushesStarted.Load(),
 			"Singleflight should coalesce all flush requests into one")
 	})
+}
+
+// TestReplayControllerBackpressureErrorIsTyped verifies that WithBackPressure returns a typed
+// ReplayBackpressureError when a flush makes no progress and cannot recover below the ceiling.
+func TestReplayControllerBackpressureErrorIsTyped(t *testing.T) {
+	flusher := newDumbFlusher(nil) // no-op: never calls rc.Sub, so bytes never decrease
+	rc := newReplayController(nilMetrics(), WALConfig{ReplayMemoryCeiling: 100}, flusher)
+
+	// Exceed 90% threshold (ceiling = 90).
+	rc.Add(95)
+
+	err := rc.WithBackPressure(func() error {
+		return nil
+	})
+
+	require.Error(t, err)
+	var bpErr *ReplayBackpressureError
+	require.True(t, errors.As(err, &bpErr), "error should be a ReplayBackpressureError")
+	require.Equal(t, uint64(95), bpErr.inUse)
+	require.Equal(t, uint64(100), bpErr.ceiling)
 }

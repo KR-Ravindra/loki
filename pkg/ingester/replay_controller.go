@@ -1,6 +1,7 @@
 package ingester
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/dustin/go-humanize"
@@ -10,6 +11,26 @@ import (
 
 	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
+
+// ReplayBackpressureError indicates that a WAL replay flush made no progress
+// and could not recover below the replay memory ceiling. This is distinct from
+// actual WAL corruption and does not indicate a corrupt file; it indicates a
+// system-level issue like slow object storage, chunk retention, or a too-low
+// replay_memory_ceiling.
+type ReplayBackpressureError struct {
+	inUse uint64 // bytes currently in use during the backpressure
+	ceiling uint64 // memory ceiling (90% of ReplayMemoryCeiling)
+}
+
+func (e *ReplayBackpressureError) Error() string {
+	return fmt.Sprintf("WAL replay flush made no progress: %s in use, ceiling %s; cannot recover",
+		humanize.Bytes(e.inUse), humanize.Bytes(e.ceiling))
+}
+
+// IsBackpressureError checks if the provided error is a ReplayBackpressureError.
+func IsBackpressureError(err error) bool {
+	return errors.As(err, new(*ReplayBackpressureError))
+}
 
 type replayFlusher struct {
 	i *Ingester
@@ -138,10 +159,10 @@ func (c *replayController) WithBackPressure(fn func() error) error {
 		// our own flush legitimately has nothing to do and we should simply exit
 		// the loop rather than report a spurious no-progress error.
 		if c.Flush() == 0 && c.Cur() > ceiling {
-			return fmt.Errorf("WAL replay flush made no progress: %s in use, ceiling %s; cannot recover",
-				humanize.Bytes(uint64(c.currentBytes.Load())),
-				humanize.Bytes(uint64(ceiling)),
-			)
+			return &ReplayBackpressureError{
+				inUse: uint64(c.currentBytes.Load()),
+				ceiling: uint64(c.cfg.ReplayMemoryCeiling),
+			}
 		}
 	}
 
